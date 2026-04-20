@@ -186,9 +186,9 @@ pub async fn resolve_dependencies(
                     if v.is_some() {
                         tracing::warn!("Ignoring version override for local package");
                     }
-                    let path = tokio::fs::canonicalize(path)
-                        .await
-                        .with_context(|| format!("resolving local dependency {}", path.display()))?;
+                    let path = tokio::fs::canonicalize(path).await.with_context(|| {
+                        format!("resolving local dependency {}", path.display())
+                    })?;
                     Dependency::Local(path)
                 }
                 (None, Some(version)) => Dependency::Package(RegistryPackage {

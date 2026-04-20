@@ -11,7 +11,10 @@ use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
 };
 use tokio::{net::TcpListener, process::Command};
-use wasm_pkg_client::{oci::OciRegistryConfig, Config, CustomConfig, Registry, RegistryMetadata};
+use wasm_pkg_client::{
+    oci::{OciProtocol, OciRegistryConfig},
+    Config, CustomConfig, Registry, RegistryMetadata,
+};
 
 /// Returns an open port on localhost
 pub async fn find_open_port() -> u16 {
@@ -52,6 +55,7 @@ pub async fn start_registry() -> (Config, Registry, ContainerAsync<GenericImage>
                     protocol: oci_client::client::ClientProtocol::Http,
                     ..Default::default()
                 },
+                protocol: OciProtocol::Http,
                 credentials: None,
             },
         )

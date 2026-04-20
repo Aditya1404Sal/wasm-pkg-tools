@@ -3,10 +3,20 @@ use base64::{
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
     Engine,
 };
-use oci_client::client::ClientConfig;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, Serializer};
 use wasm_pkg_common::{config::RegistryConfig, Error};
+
+#[cfg(not(feature = "wasm"))]
+use oci_client::client::ClientConfig;
+
+/// The protocol to use for OCI registry communication.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum OciProtocol {
+    Http,
+    #[default]
+    Https,
+}
 
 /// Registry configuration for OCI backends.
 ///
@@ -14,12 +24,18 @@ use wasm_pkg_common::{config::RegistryConfig, Error};
 #[derive(Default, Serialize)]
 #[serde(into = "OciRegistryConfigToml")]
 pub struct OciRegistryConfig {
+    /// The full oci_client ClientConfig (only available on native).
+    #[cfg(not(feature = "wasm"))]
     pub client_config: ClientConfig,
+    /// Protocol selection (available on all targets).
+    #[serde(skip)]
+    pub protocol: OciProtocol,
     pub credentials: Option<BasicCredentials>,
 }
 
 impl Clone for OciRegistryConfig {
     fn clone(&self) -> Self {
+        #[cfg(not(feature = "wasm"))]
         let client_config = ClientConfig {
             protocol: self.client_config.protocol.clone(),
             extra_root_certificates: self.client_config.extra_root_certificates.clone(),
@@ -31,7 +47,9 @@ impl Clone for OciRegistryConfig {
             ..self.client_config
         };
         Self {
+            #[cfg(not(feature = "wasm"))]
             client_config,
+            protocol: self.protocol.clone(),
             credentials: self.credentials.clone(),
         }
     }
@@ -40,7 +58,7 @@ impl Clone for OciRegistryConfig {
 impl std::fmt::Debug for OciRegistryConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OciConfig")
-            .field("client_config", &"...")
+            .field("protocol", &self.protocol)
             .field("credentials", &self.credentials)
             .finish()
     }
@@ -52,16 +70,35 @@ impl TryFrom<&RegistryConfig> for OciRegistryConfig {
     fn try_from(registry_config: &RegistryConfig) -> Result<Self, Self::Error> {
         let OciRegistryConfigToml { auth, protocol } =
             registry_config.backend_config("oci")?.unwrap_or_default();
-        let mut client_config = ClientConfig::default();
-        if let Some(protocol) = protocol {
-            client_config.protocol = oci_client_protocol(&protocol)?;
+
+        let oci_protocol = match protocol.as_deref() {
+            Some("http") => OciProtocol::Http,
+            Some("https") | None => OciProtocol::Https,
+            Some(other) => {
+                return Err(Error::InvalidConfig(anyhow::anyhow!(
+                    "Unknown OCI protocol {other:?}"
+                )));
+            }
         };
+
+        #[cfg(not(feature = "wasm"))]
+        let client_config = {
+            let mut cfg = ClientConfig::default();
+            if let Some(ref p) = protocol {
+                cfg.protocol = oci_client_protocol(p)?;
+            }
+            cfg
+        };
+
         let credentials = auth
             .map(TryInto::try_into)
             .transpose()
             .map_err(Error::InvalidConfig)?;
+
         Ok(Self {
+            #[cfg(not(feature = "wasm"))]
             client_config,
+            protocol: oci_protocol,
             credentials,
         })
     }
@@ -75,12 +112,16 @@ struct OciRegistryConfigToml {
 
 impl From<OciRegistryConfig> for OciRegistryConfigToml {
     fn from(value: OciRegistryConfig) -> Self {
+        let protocol_str = match value.protocol {
+            OciProtocol::Http => "http",
+            OciProtocol::Https => "https",
+        };
         OciRegistryConfigToml {
             auth: value.credentials.map(|c| TomlAuth::UsernamePassword {
                 username: c.username,
                 password: c.password,
             }),
-            protocol: Some(oci_protocol_string(&value.client_config.protocol)),
+            protocol: Some(protocol_str.to_string()),
         }
     }
 }
@@ -135,6 +176,7 @@ impl TryFrom<TomlAuth> for BasicCredentials {
     }
 }
 
+#[cfg(not(feature = "wasm"))]
 fn oci_client_protocol(text: &str) -> Result<oci_client::client::ClientProtocol, Error> {
     match text {
         "http" => Ok(oci_client::client::ClientProtocol::Http),
@@ -142,15 +184,6 @@ fn oci_client_protocol(text: &str) -> Result<oci_client::client::ClientProtocol,
         _ => Err(Error::InvalidConfig(anyhow::anyhow!(
             "Unknown OCI protocol {text:?}"
         ))),
-    }
-}
-
-fn oci_protocol_string(protocol: &oci_client::client::ClientProtocol) -> String {
-    match protocol {
-        oci_client::client::ClientProtocol::Http => "http".into(),
-        oci_client::client::ClientProtocol::Https => "https".into(),
-        // Default to https if not specified
-        _ => "https".into(),
     }
 }
 
@@ -193,10 +226,7 @@ mod tests {
         let BasicCredentials { username, password } = oci_config.credentials.as_ref().unwrap();
         assert_eq!(username, "open");
         assert_eq!(password.expose_secret(), "sesame");
-        assert_eq!(
-            oci_client::client::ClientProtocol::Http,
-            oci_config.client_config.protocol
-        );
+        assert_eq!(OciProtocol::Http, oci_config.protocol);
 
         let oci_config: OciRegistryConfig = cfg
             .registry_config(&"wasi.dev".parse().unwrap())
@@ -211,10 +241,12 @@ mod tests {
     #[test]
     fn test_roundtrip() {
         let config = OciRegistryConfig {
+            #[cfg(not(feature = "wasm"))]
             client_config: oci_client::client::ClientConfig {
                 protocol: oci_client::client::ClientProtocol::Http,
                 ..Default::default()
             },
+            protocol: OciProtocol::Http,
             credentials: Some(BasicCredentials {
                 username: "open".into(),
                 password: SecretString::new("sesame".into()),
@@ -234,8 +266,8 @@ mod tests {
 
         let roundtripped = OciRegistryConfig::try_from(reg_conf).expect("Unable to load config");
         assert_eq!(
-            roundtripped.client_config.protocol, config.client_config.protocol,
-            "Home url should be set to the right value"
+            roundtripped.protocol, config.protocol,
+            "Protocol should be set to the right value"
         );
         let creds = config.credentials.unwrap();
         let roundtripped_creds = roundtripped.credentials.expect("Should have creds");

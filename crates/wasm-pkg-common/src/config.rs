@@ -1,8 +1,8 @@
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    io::ErrorKind,
-    path::{Path, PathBuf},
-};
+use std::collections::{hash_map::Entry, HashMap};
+#[cfg(not(target_family = "wasm"))]
+use std::io::ErrorKind;
+#[cfg(not(target_family = "wasm"))]
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +104,7 @@ impl Config {
     ///
     /// Note: This list is expected to expand in the future to include
     /// "workspace" config files like `./.wasm-pkg/config.toml`.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn global_defaults() -> Result<Self, Error> {
         let mut config = Self::default();
         if let Some(global_config) = Self::read_global_config().await? {
@@ -113,6 +114,7 @@ impl Config {
     }
 
     /// Reads config from the default global config file location
+    #[cfg(not(target_family = "wasm"))]
     pub async fn read_global_config() -> Result<Option<Self>, Error> {
         let path = match Config::global_config_path() {
             Some(path) => path,
@@ -127,6 +129,7 @@ impl Config {
     }
 
     /// Returns the default global config file location
+    #[cfg(not(target_family = "wasm"))]
     pub fn global_config_path() -> Option<PathBuf> {
         use etcetera::BaseStrategy;
         etcetera::choose_base_strategy()
@@ -135,6 +138,7 @@ impl Config {
     }
 
     /// Reads config from a TOML file at the given path.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn from_file(path: impl AsRef<Path>) -> Result<Self, Error> {
         let contents = tokio::fs::read_to_string(path)
             .await
@@ -149,6 +153,7 @@ impl Config {
     }
 
     /// Writes the config to a TOML file at the given path.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn to_file(&self, path: impl AsRef<Path>) -> Result<(), Error> {
         let toml_str = ::toml::to_string(&self).map_err(invalid_config)?;
         tokio::fs::write(path, toml_str)

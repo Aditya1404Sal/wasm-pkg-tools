@@ -6,15 +6,22 @@
 
 mod config;
 mod loader;
+#[cfg(not(feature = "wasm"))]
 mod publisher;
+pub mod transport;
 
+#[cfg(not(feature = "wasm"))]
+mod transport_default;
+#[cfg(feature = "wasm")]
+mod transport_wasm;
+
+#[cfg(not(feature = "wasm"))]
 use docker_credential::{CredentialRetrievalError, DockerCredential};
-use oci_client::{
-    errors::OciDistributionError, secrets::RegistryAuth, Reference, RegistryOperation,
-};
+
+#[cfg(not(feature = "wasm"))]
+use oci_client::errors::OciDistributionError;
 use secrecy::ExposeSecret;
 use serde::Deserialize;
-use tokio::sync::OnceCell;
 use wasm_pkg_common::{
     config::RegistryConfig,
     metadata::RegistryMetadata,
@@ -23,10 +30,13 @@ use wasm_pkg_common::{
     Error,
 };
 
-/// Re-exported for convenience.
-pub use oci_client::client;
+pub use config::{BasicCredentials, OciProtocol, OciRegistryConfig};
+pub use transport::{OciCredentials, OciOperation, OciReference, OciTransport};
 
-pub use config::{BasicCredentials, OciRegistryConfig};
+#[cfg(not(feature = "wasm"))]
+pub use transport_default::DefaultOciTransport;
+#[cfg(feature = "wasm")]
+pub use transport_wasm::WasmOciTransport;
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,11 +46,10 @@ struct OciRegistryMetadata {
 }
 
 pub(crate) struct OciBackend {
-    client: oci_wasm::WasmClient,
+    transport: Box<dyn OciTransport>,
     oci_registry: String,
     namespace_prefix: Option<String>,
-    credentials: Option<BasicCredentials>,
-    registry_auth: OnceCell<RegistryAuth>,
+    credentials: OciCredentials,
 }
 
 impl OciBackend {
@@ -49,87 +58,77 @@ impl OciBackend {
         registry_config: &RegistryConfig,
         registry_meta: &RegistryMetadata,
     ) -> Result<Self, Error> {
-        let OciRegistryConfig {
-            client_config,
-            credentials,
-        } = registry_config.try_into()?;
-        let client = oci_client::Client::new(client_config);
-        let client = oci_wasm::WasmClient::new(client);
+        let oci_config: OciRegistryConfig = registry_config.try_into()?;
+        let credentials = oci_config.credentials.clone();
+
+        #[cfg(not(feature = "wasm"))]
+        let transport: Box<dyn OciTransport> =
+            Box::new(DefaultOciTransport::new(oci_config.client_config));
+
+        #[cfg(feature = "wasm")]
+        let transport: Box<dyn OciTransport> = Box::new(WasmOciTransport::new(oci_config.protocol));
 
         let oci_meta = registry_meta
             .protocol_config::<OciRegistryMetadata>("oci")?
             .unwrap_or_default();
         let oci_registry = oci_meta.registry.unwrap_or_else(|| registry.to_string());
 
+        // Convert BasicCredentials to OciCredentials
+        let oci_credentials = match &credentials {
+            Some(BasicCredentials { username, password }) => {
+                OciCredentials::Basic(username.clone(), password.expose_secret().clone())
+            }
+            None => Self::get_docker_credentials(&oci_registry),
+        };
+
         Ok(Self {
-            client,
+            transport,
             oci_registry,
             namespace_prefix: oci_meta.namespace_prefix,
-            credentials,
-            registry_auth: OnceCell::new(),
+            credentials: oci_credentials,
         })
     }
 
     pub(crate) async fn auth(
         &self,
-        reference: &Reference,
-        operation: RegistryOperation,
-    ) -> Result<RegistryAuth, Error> {
-        self.registry_auth
-            .get_or_try_init(|| async {
-                let mut auth = self.get_credentials()?;
-                // Preflight auth to check for validity; this isn't wasted
-                // effort because the oci_client::Client caches it
-                use oci_client::errors::OciDistributionError::AuthenticationFailure;
-                match self.client.auth(reference, &auth, operation).await {
-                    Ok(_) => (),
-                    Err(err @ AuthenticationFailure(_)) if auth != RegistryAuth::Anonymous => {
-                        // The failed credentials might not even be required for this image; retry anonymously
-                        if self
-                            .client
-                            .auth(reference, &RegistryAuth::Anonymous, operation)
-                            .await
-                            .is_ok()
-                        {
-                            auth = RegistryAuth::Anonymous;
-                        } else {
-                            return Err(oci_registry_error(err));
-                        }
-                    }
-                    Err(err) => return Err(oci_registry_error(err)),
-                }
-                Ok(auth)
-            })
+        reference: &OciReference,
+        operation: OciOperation,
+    ) -> Result<OciCredentials, Error> {
+        // Always delegate to the transport so it can handle per-repository
+        // token caching (e.g. GHCR issues repo-scoped bearer tokens).
+        self.transport
+            .auth(reference, &self.credentials, operation)
             .await
-            .cloned()
     }
 
-    pub(crate) fn get_credentials(&self) -> Result<RegistryAuth, Error> {
-        if let Some(BasicCredentials { username, password }) = &self.credentials {
-            return Ok(RegistryAuth::Basic(
-                username.clone(),
-                password.expose_secret().clone(),
-            ));
-        }
-
-        match get_docker_credential(&self.oci_registry)? {
-            Some(c) => Ok(c),
-            None => {
+    /// Look up docker credentials from the credential store.
+    #[cfg(not(feature = "wasm"))]
+    fn get_docker_credentials(oci_registry: &str) -> OciCredentials {
+        match get_docker_credential(oci_registry) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
                 tracing::debug!("Failed to look up OCI credentials by registry, trying server URL");
-                let server_url = format!("https://{}", self.oci_registry);
-                match get_docker_credential(&server_url)? {
-                    Some(c) => Ok(c),
-                    None => Ok(RegistryAuth::Anonymous),
+                let server_url = format!("https://{}", oci_registry);
+                match get_docker_credential(&server_url) {
+                    Ok(Some(c)) => c,
+                    Ok(None) | Err(_) => OciCredentials::Anonymous,
                 }
             }
+            Err(_) => OciCredentials::Anonymous,
         }
+    }
+
+    /// Docker credential store is not available in wasm.
+    #[cfg(feature = "wasm")]
+    fn get_docker_credentials(_oci_registry: &str) -> OciCredentials {
+        OciCredentials::Anonymous
     }
 
     pub(crate) fn make_reference(
         &self,
         package: &PackageRef,
         version: Option<&Version>,
-    ) -> Reference {
+    ) -> OciReference {
         let repository = format!(
             "{}{}/{}",
             self.namespace_prefix.as_deref().unwrap_or_default(),
@@ -139,22 +138,23 @@ impl OciBackend {
         let tag = version
             .map(|ver| ver.to_string())
             .unwrap_or_else(|| "latest".into());
-        Reference::with_tag(self.oci_registry.clone(), repository, tag)
+        OciReference::new(self.oci_registry.clone(), repository, tag)
     }
 }
 
+#[cfg(not(feature = "wasm"))]
 pub(crate) fn oci_registry_error(err: OciDistributionError) -> Error {
     match err {
-        // Technically this could be a missing version too, but there really isn't a way to find out
         OciDistributionError::ImageManifestNotFoundError(_) => Error::PackageNotFound,
         _ => Error::RegistryError(err.into()),
     }
 }
 
-fn get_docker_credential(registry: &str) -> Result<Option<RegistryAuth>, Error> {
+#[cfg(not(feature = "wasm"))]
+fn get_docker_credential(registry: &str) -> Result<Option<OciCredentials>, Error> {
     match docker_credential::get_credential(registry) {
         Ok(DockerCredential::UsernamePassword(username, password)) => {
-            return Ok(Some(RegistryAuth::Basic(username, password)));
+            return Ok(Some(OciCredentials::Basic(username, password)));
         }
         Ok(DockerCredential::IdentityToken(_)) => {
             return Err(Error::CredentialError(anyhow::anyhow!(

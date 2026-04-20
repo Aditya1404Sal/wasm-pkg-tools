@@ -10,9 +10,13 @@ readme = "../../README.md"
 
 [features]
 registry-config = [
+    "dep:toml",
+]
+# Enables filesystem-based config loading (not available in wasm targets)
+registry-config-fs = [
+    "registry-config",
     "dep:etcetera",
     "dep:tokio",
-    "dep:toml",
 ]
 # Extra features to facilitate making working with OCI images easier
 oci_extras = []

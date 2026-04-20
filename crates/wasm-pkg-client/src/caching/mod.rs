@@ -9,8 +9,10 @@ use wasm_pkg_common::{
 
 use crate::{Client, ContentStream, Release, VersionInfo};
 
+#[cfg(not(feature = "wasm"))]
 mod file;
 
+#[cfg(not(feature = "wasm"))]
 pub use file::FileCache;
 
 /// A trait for a cache of data.

@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
-use oci_client::{manifest::OciDescriptor, RegistryOperation};
-use warg_protocol::Version;
-use wasm_pkg_common::{package::PackageRef, Error};
+use wasm_pkg_common::{
+    package::{PackageRef, Version},
+    Error,
+};
 
 use crate::{
     loader::PackageLoader,
@@ -10,21 +11,21 @@ use crate::{
     ContentStream,
 };
 
-use super::{oci_registry_error, OciBackend};
+use super::transport::OciOperation;
+use super::OciBackend;
 
 #[async_trait]
 impl PackageLoader for OciBackend {
     async fn list_all_versions(&self, package: &PackageRef) -> Result<Vec<VersionInfo>, Error> {
         let reference = self.make_reference(package, None);
 
-        tracing::debug!(?reference, "Listing tags for OCI reference");
-        let auth = self.auth(&reference, RegistryOperation::Pull).await?;
+        tracing::debug!(?reference.registry, ?reference.repository, "Listing tags for OCI reference");
+        let auth = self.auth(&reference, OciOperation::Pull).await?;
         let resp = self
-            .client
+            .transport
             .list_tags(&reference, &auth, None, None)
-            .await
-            .map_err(oci_registry_error)?;
-        tracing::trace!(response = ?resp, "List tags response");
+            .await?;
+        tracing::trace!(tags = ?resp.tags, "List tags response");
 
         // Return only tags that parse as valid semver versions.
         let versions = resp
@@ -47,14 +48,13 @@ impl PackageLoader for OciBackend {
     async fn get_release(&self, package: &PackageRef, version: &Version) -> Result<Release, Error> {
         let reference = self.make_reference(package, Some(version));
 
-        tracing::debug!(?reference, "Fetching image manifest for OCI reference");
-        let auth = self.auth(&reference, RegistryOperation::Pull).await?;
-        let (manifest, _config, _digest) = self
-            .client
+        tracing::debug!(?reference.registry, ?reference.repository, ?reference.tag, "Fetching image manifest for OCI reference");
+        let auth = self.auth(&reference, OciOperation::Pull).await?;
+        let (manifest, _digest) = self
+            .transport
             .pull_manifest_and_config(&reference, &auth)
-            .await
-            .map_err(Error::RegistryError)?;
-        tracing::trace!(?manifest, "Got manifest");
+            .await?;
+        tracing::trace!(?manifest.layers, "Got manifest");
 
         let version = version.to_owned();
         let content_digest = manifest
@@ -78,16 +78,11 @@ impl PackageLoader for OciBackend {
         release: &Release,
     ) -> Result<ContentStream, Error> {
         let reference = self.make_reference(package, None);
-        let descriptor = OciDescriptor {
-            digest: release.content_digest.to_string(),
-            ..Default::default()
-        };
-        self.auth(&reference, RegistryOperation::Pull).await?;
+        let auth = self.auth(&reference, OciOperation::Pull).await?;
         let stream = self
-            .client
-            .pull_blob_stream(&reference, &descriptor)
-            .await
-            .map_err(oci_registry_error)?;
+            .transport
+            .pull_blob_stream(&reference, &auth, &release.content_digest.to_string())
+            .await?;
         Ok(stream.map_err(Into::into).boxed())
     }
 }

@@ -26,25 +26,44 @@
 //! # Ok(()) }
 //! ```
 
+#[cfg(all(feature = "native", feature = "wasm"))]
+compile_error!("features `native` and `wasm` are mutually exclusive");
+
+#[cfg(not(any(feature = "native", feature = "wasm")))]
+compile_error!("either the `native` or `wasm` feature must be enabled");
+
+#[cfg(not(feature = "wasm"))]
 pub mod caching;
+pub mod http_client;
 mod loader;
+#[cfg(not(feature = "wasm"))]
 pub mod local;
 pub mod metadata;
 pub mod oci;
+#[cfg(not(feature = "wasm"))]
 mod publisher;
 mod release;
+#[cfg(not(feature = "wasm"))]
 pub mod warg;
 
-use std::path::Path;
+#[cfg(not(feature = "wasm"))]
+mod http_client_default;
+#[cfg(feature = "wasm")]
+mod http_client_wasm;
+
 use std::sync::Arc;
 use std::{collections::HashMap, pin::Pin};
 
 use anyhow::anyhow;
 use bytes::Bytes;
 use futures_util::Stream;
+use http_client::HttpClient;
+#[cfg(not(feature = "wasm"))]
 use publisher::PackagePublisher;
+#[cfg(not(feature = "wasm"))]
 use tokio::io::AsyncSeekExt;
 use tokio::sync::RwLock;
+#[cfg(not(feature = "wasm"))]
 use tokio_util::io::SyncIoBridge;
 pub use wasm_pkg_common::{
     config::{Config, CustomConfig, RegistryMapping},
@@ -54,31 +73,44 @@ pub use wasm_pkg_common::{
     registry::Registry,
     Error,
 };
+#[cfg(not(feature = "wasm"))]
 use wit_component::DecodedWasm;
 
+#[cfg(not(feature = "wasm"))]
+use crate::local::LocalBackend;
 use crate::metadata::RegistryMetadataExt;
-use crate::{loader::PackageLoader, local::LocalBackend, oci::OciBackend, warg::WargBackend};
+#[cfg(not(feature = "wasm"))]
+use crate::warg::WargBackend;
+use crate::{loader::PackageLoader, oci::OciBackend};
 
 pub use release::{Release, VersionInfo};
 
 /// An alias for a stream of content bytes
 pub type ContentStream = Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send + 'static>>;
 
+#[cfg(not(feature = "wasm"))]
 /// An alias for a PublishingSource (generally a file)
 pub type PublishingSource = Pin<Box<dyn ReaderSeeker + Send + Sync + 'static>>;
 
+#[cfg(not(feature = "wasm"))]
 /// A supertrait combining tokio's AsyncRead and AsyncSeek.
 pub trait ReaderSeeker: tokio::io::AsyncRead + tokio::io::AsyncSeek {}
+#[cfg(not(feature = "wasm"))]
 impl<T> ReaderSeeker for T where T: tokio::io::AsyncRead + tokio::io::AsyncSeek {}
 
+#[cfg(not(feature = "wasm"))]
 trait LoaderPublisher: PackageLoader + PackagePublisher {}
-
+#[cfg(not(feature = "wasm"))]
 impl<T> LoaderPublisher for T where T: PackageLoader + PackagePublisher {}
 
 type RegistrySources = HashMap<Registry, Arc<InnerClient>>;
+#[cfg(not(feature = "wasm"))]
 type InnerClient = Box<dyn LoaderPublisher + Sync>;
+#[cfg(feature = "wasm")]
+type InnerClient = Box<dyn PackageLoader + Sync + Send>;
 
 /// Additional options for publishing a package.
+#[cfg(not(feature = "wasm"))]
 #[derive(Clone, Debug, Default)]
 pub struct PublishOpts {
     /// Override the package name and version to publish with.
@@ -92,6 +124,18 @@ pub struct PublishOpts {
 pub struct Client {
     config: Arc<Config>,
     sources: Arc<RwLock<RegistrySources>>,
+    http_client: Arc<dyn HttpClient>,
+}
+
+fn default_http_client() -> Arc<dyn HttpClient> {
+    #[cfg(not(feature = "wasm"))]
+    {
+        Arc::new(http_client_default::DefaultHttpClient)
+    }
+    #[cfg(feature = "wasm")]
+    {
+        Arc::new(http_client_wasm::WasmHttpClient::new())
+    }
 }
 
 impl Client {
@@ -100,6 +144,7 @@ impl Client {
         Self {
             config: Arc::new(config),
             sources: Default::default(),
+            http_client: default_http_client(),
         }
     }
 
@@ -109,6 +154,7 @@ impl Client {
     }
 
     /// Returns a new client configured from default global config.
+    #[cfg(not(feature = "wasm"))]
     pub async fn with_global_defaults() -> Result<Self, Error> {
         let config = Config::global_defaults().await?;
         Ok(Self::new(config))
@@ -144,9 +190,10 @@ impl Client {
     /// Publishes the given file as a package release. The package name and version will be read
     /// from the component if not given as part of `additional_options`. Returns the package name
     /// and version of the published release.
+    #[cfg(not(feature = "wasm"))]
     pub async fn publish_release_file(
         &self,
-        file: impl AsRef<Path>,
+        file: impl AsRef<std::path::Path>,
         additional_options: PublishOpts,
     ) -> Result<(PackageRef, Version), Error> {
         let data = tokio::fs::OpenOptions::new().read(true).open(file).await?;
@@ -155,9 +202,10 @@ impl Client {
             .await
     }
 
-    /// Publishes the given reader as a package release. TThe package name and version will be read
+    /// Publishes the given reader as a package release. The package name and version will be read
     /// from the component if not given as part of `additional_options`. Returns the package name
     /// and version of the published release.
+    #[cfg(not(feature = "wasm"))]
     pub async fn publish_release_data(
         &self,
         data: PublishingSource,
@@ -245,7 +293,7 @@ impl Client {
             let registry_meta = if let Some(meta) = maybe_metadata {
                 meta
             } else if should_fetch_meta {
-                RegistryMetadata::fetch_or_default(&registry).await
+                RegistryMetadata::fetch_or_default(&registry, self.http_client.as_ref()).await
             } else {
                 RegistryMetadata::default()
             };
@@ -271,12 +319,14 @@ impl Client {
             tracing::debug!(?backend_type, "Resolved backend type");
 
             let source: InnerClient = match backend_type {
+                #[cfg(not(feature = "wasm"))]
                 "local" => Box::new(LocalBackend::new(registry_config)?),
                 "oci" => Box::new(OciBackend::new(
                     &registry,
                     &registry_config,
                     &registry_meta,
                 )?),
+                #[cfg(not(feature = "wasm"))]
                 "warg" => {
                     Box::new(WargBackend::new(&registry, &registry_config, &registry_meta).await?)
                 }
@@ -298,6 +348,7 @@ impl Client {
 /// Resolves the package name and version from the given source. This takes a wrapped publishing
 /// source to it can do a blocking read with wit_component. It returns back the underlying
 /// PublishingSource but should be rewound to the beginning of the source
+#[cfg(not(feature = "wasm"))]
 fn resolve_package(
     mut data: SyncIoBridge<PublishingSource>,
 ) -> Result<(PublishingSource, PackageRef, Version), Error> {
