@@ -17,8 +17,8 @@ use wasm_pkg_common::Error;
 
 use super::oci_registry_error;
 use super::transport::{
-    OciCredentials, OciLayerDescriptor, OciManifest, OciOperation, OciReference, OciTransport,
-    PushConfig, PushLayer, TagList,
+    CatalogPage, OciCredentials, OciLayerDescriptor, OciManifest, OciOperation, OciReference,
+    OciTransport, PushConfig, PushLayer, TagList,
 };
 
 // ---------------------------------------------------------------------------
@@ -170,6 +170,67 @@ impl OciTransport for DefaultOciTransport {
         Ok(Box::pin(stream))
     }
 
+    async fn list_catalog(
+        &self,
+        registry: &str,
+        credentials: &OciCredentials,
+        n: Option<usize>,
+        last: Option<&str>,
+    ) -> Result<CatalogPage, Error> {
+        // oci_client has no _catalog method, so we call it directly via reqwest.
+        let scheme = if registry == "localhost" || registry.starts_with("localhost:") {
+            "http"
+        } else {
+            "https"
+        };
+        let mut url = format!("{scheme}://{registry}/v2/_catalog");
+        let mut has_query = false;
+        if let Some(n) = n {
+            url.push_str(&format!("?n={n}"));
+            has_query = true;
+        }
+        if let Some(last) = last {
+            url.push(if has_query { '&' } else { '?' });
+            url.push_str(&format!("last={}", urlencoding_simple(last)));
+        }
+
+        let mut req = reqwest::Client::new().get(&url);
+        if let OciCredentials::Basic(user, pass) = credentials {
+            req = req.basic_auth(user, Some(pass));
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| Error::RegistryError(e.into()))?;
+
+        // Parse the optional Link header for the next page cursor before we
+        // consume the response body.
+        let next_last = parse_link_header_last(resp.headers());
+
+        if !resp.status().is_success() {
+            return Err(Error::RegistryError(anyhow::anyhow!(
+                "HTTP {} from /v2/_catalog on {registry}",
+                resp.status()
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct CatalogResp {
+            repositories: Vec<String>,
+        }
+
+        let body: CatalogResp = resp
+            .json()
+            .await
+            .map_err(|e| Error::RegistryError(e.into()))?;
+
+        Ok(CatalogPage {
+            repositories: body.repositories,
+            next_last,
+        })
+    }
+
     async fn push(
         &self,
         reference: &OciReference,
@@ -208,4 +269,38 @@ impl OciTransport for DefaultOciTransport {
             .map_err(oci_registry_error)?;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Catalog helpers
+// ---------------------------------------------------------------------------
+
+/// Parse the `last=` cursor out of an OCI pagination Link header.
+///
+/// The registry returns a header like:
+///   `Link: </v2/_catalog?last=foo&n=100>; rel="next"`
+/// We extract the `last=` query parameter value as the cursor.
+fn parse_link_header_last(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get("link")?.to_str().ok()?;
+    // Find the URL part inside angle brackets.
+    let start = link.find('<')? + 1;
+    let end = link.find('>')?;
+    let url_part = &link[start..end];
+    // Extract the `last=` query parameter.
+    url_part.split('?').nth(1).and_then(|query| {
+        query.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            if k == "last" {
+                Some(v.to_string())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// Minimal percent-encoding for `last=` query parameter values (just encodes
+/// `/` and `+` which appear in repository names).
+fn urlencoding_simple(s: &str) -> String {
+    s.replace('/', "%2F").replace('+', "%2B")
 }

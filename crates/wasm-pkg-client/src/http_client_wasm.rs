@@ -23,13 +23,23 @@ impl WasmHttpClient {
 
 #[async_trait]
 impl HttpClient for WasmHttpClient {
-    async fn get_json_bytes(&self, url: &str) -> Result<Option<Vec<u8>>, Error> {
+    async fn get_json_bytes_authed(
+        &self,
+        url: &str,
+        bearer_token: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, Error> {
         tracing::debug!(?url, "Fetching URL via wstd");
 
-        let req = wstd_http::Request::builder()
+        let mut builder = wstd_http::Request::builder()
             .method(wstd_http::Method::GET)
             .uri(url)
-            .header("Accept", "application/json")
+            .header("Accept", "application/json");
+
+        if let Some(token) = bearer_token {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let req = builder
             .body(wstd_http::Body::empty())
             .map_err(|e| Error::RegistryMetadataError(e.into()))?;
 

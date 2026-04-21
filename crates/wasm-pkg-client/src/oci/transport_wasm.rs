@@ -17,8 +17,8 @@ use wstd::http as wstd_http;
 
 use super::config::OciProtocol;
 use super::transport::{
-    OciCredentials, OciLayerDescriptor, OciManifest, OciOperation, OciReference, OciTransport,
-    PushConfig, PushLayer, TagList,
+    CatalogPage, OciCredentials, OciLayerDescriptor, OciManifest, OciOperation, OciReference,
+    OciTransport, PushConfig, PushLayer, TagList,
 };
 
 /// Accept header value for OCI image manifests.
@@ -508,6 +508,69 @@ impl OciTransport for WasmOciTransport {
         })))
     }
 
+    async fn list_catalog(
+        &self,
+        registry: &str,
+        credentials: &OciCredentials,
+        n: Option<usize>,
+        last: Option<&str>,
+    ) -> Result<CatalogPage, Error> {
+        let mut url = format!("{}/v2/_catalog", self.base_url(registry));
+        let mut has_query = false;
+        if let Some(n) = n {
+            url.push_str(&format!("?n={n}"));
+            has_query = true;
+        }
+        if let Some(last) = last {
+            url.push(if has_query { '&' } else { '?' });
+            // Percent-encode slashes in repository names.
+            let encoded = last.replace('/', "%2F");
+            url.push_str(&format!("last={encoded}"));
+        }
+
+        // _catalog is registry-wide (not repo-scoped), so pass an empty
+        // repository string — no cached bearer token will match.
+        let req = self
+            .authorized_request(wstd_http::Method::GET, &url, credentials, "")?
+            .body(wstd_http::Body::empty())
+            .map_err(|e| Error::RegistryError(e.into()))?;
+
+        let mut resp = self.send(req).await?;
+
+        // Extract Link header cursor before consuming the body.
+        let next_last = resp
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_link_last);
+
+        if !resp.status().is_success() {
+            return Err(Error::RegistryError(anyhow::anyhow!(
+                "HTTP {} from /v2/_catalog on {registry}",
+                resp.status()
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct CatalogResp {
+            repositories: Vec<String>,
+        }
+
+        let body = resp
+            .body_mut()
+            .contents()
+            .await
+            .map_err(|e| Error::RegistryError(e.into()))?;
+
+        let catalog: CatalogResp =
+            serde_json::from_slice(body).map_err(|e| Error::RegistryError(e.into()))?;
+
+        Ok(CatalogPage {
+            repositories: catalog.repositories,
+            next_last,
+        })
+    }
+
     async fn push(
         &self,
         reference: &OciReference,
@@ -703,6 +766,24 @@ fn parse_www_authenticate(header: &str) -> Result<(String, Vec<(String, String)>
 
 /// Split challenge parameters, respecting quoted strings.
 /// e.g. `realm="https://auth.example.com/token",service="registry",scope="repository:foo:pull"`
+/// Extract the `last=` cursor from an OCI Link header value.
+/// Header looks like: `</v2/_catalog?last=foo&n=100>; rel="next"`
+fn parse_link_last(link: &str) -> Option<String> {
+    let start = link.find('<')? + 1;
+    let end = link.find('>')?;
+    let url_part = &link[start..end];
+    url_part.split('?').nth(1).and_then(|query| {
+        query.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            if k == "last" {
+                Some(v.to_string())
+            } else {
+                None
+            }
+        })
+    })
+}
+
 fn split_challenge_params(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;

@@ -55,6 +55,15 @@ pub struct TagList {
     pub tags: Vec<String>,
 }
 
+/// A page of repository names returned by the registry catalog API.
+pub struct CatalogPage {
+    /// Repository names (e.g. `"wasco-dev/my-pkg"`).
+    pub repositories: Vec<String>,
+    /// Opaque cursor to pass as `last=` to get the next page, or `None` if
+    /// this is the final page.
+    pub next_last: Option<String>,
+}
+
 /// Describes a layer/blob in a manifest.
 #[derive(Clone, Debug, Default)]
 pub struct OciLayerDescriptor {
@@ -125,6 +134,20 @@ pub trait OciTransport: Send + Sync {
         credentials: &OciCredentials,
         digest: &str,
     ) -> Result<BoxStream<'static, Result<Bytes, std::io::Error>>, Error>;
+
+    /// Enumerate repositories visible to this client via `GET /v2/_catalog`.
+    ///
+    /// Returns one page of repository names.  Pass `last` from a prior
+    /// [`CatalogPage::next_last`] to paginate.  Not all registries support this
+    /// endpoint (e.g. ghcr.io returns 403); callers should treat an error as
+    /// "catalog not available" and fall back gracefully.
+    async fn list_catalog(
+        &self,
+        registry: &str,
+        credentials: &OciCredentials,
+        n: Option<usize>,
+        last: Option<&str>,
+    ) -> Result<CatalogPage, Error>;
 
     /// Push a wasm artifact (layer + config + annotations) to the registry.
     async fn push(

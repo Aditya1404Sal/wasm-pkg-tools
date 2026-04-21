@@ -11,9 +11,19 @@ pub struct DefaultHttpClient;
 
 #[async_trait]
 impl HttpClient for DefaultHttpClient {
-    async fn get_json_bytes(&self, url: &str) -> Result<Option<Vec<u8>>, Error> {
+    async fn get_json_bytes_authed(
+        &self,
+        url: &str,
+        bearer_token: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, Error> {
         tracing::debug!(?url, "Fetching URL");
-        let resp = reqwest::get(url)
+        let client = reqwest::Client::new();
+        let mut req = client.get(url);
+        if let Some(token) = bearer_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .send()
             .await
             .map_err(|e| Error::RegistryMetadataError(e.into()))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
