@@ -12,11 +12,12 @@ readme = "../../README.md"
 registry-config = [
     "dep:toml",
 ]
-# Enables filesystem-based config loading (not available in wasm targets)
+# Filesystem-based config loading. On non-wasm targets `tokio` and `etcetera`
+# are pulled in unconditionally via the `[target.'cfg(...)']` block below
+# (matching the `#[cfg(not(target_family = "wasm"))]` gates in src/config.rs),
+# so this feature is retained as a no-op alias for backward compatibility.
 registry-config-fs = [
     "registry-config",
-    "dep:etcetera",
-    "dep:tokio",
 ]
 # Extra features to facilitate making working with OCI images easier
 oci_extras = []
@@ -24,16 +25,20 @@ oci_extras = []
 [dependencies]
 anyhow = { workspace = true }
 bytes = { workspace = true }
-etcetera = { workspace = true, optional = true }
 futures-util = { workspace = true }
 http = "1.1.0"
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-tokio = { workspace = true, optional = true, features = ["fs"] }
 toml = { workspace = true, optional = true }
 thiserror = { workspace = true }
+
+# Filesystem helpers are only used on non-wasm targets; pull them in there
+# unconditionally so they line up with the cfg gates in src/config.rs.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+etcetera = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

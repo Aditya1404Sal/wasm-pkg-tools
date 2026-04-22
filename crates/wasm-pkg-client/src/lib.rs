@@ -166,19 +166,18 @@ impl Client {
         source.list_all_versions(package).await
     }
 
-    /// Discover all packages available in `namespace` on the given `registry`.
-    ///
-    /// For `ghcr.io` the GitHub Packages REST API is used (supply a PAT with
-    /// `read:packages` scope as `github_token`).  For other OCI registries the
-    /// standard `GET /v2/_catalog` endpoint is used.
+    /// Discover all packages available in `namespace` on the given `registry`
+    /// via the OCI distribution `GET /v2/_catalog` endpoint.
     ///
     /// The client's namespace→registry mapping must already be configured so
     /// that any subsequent [`list_all_versions`] calls route to the right place.
+    ///
+    /// Note: not all OCI registries allow `_catalog`. `ghcr.io` returns 403
+    /// for this endpoint, so discovery against GHCR is not supported.
     pub async fn list_packages_in_namespace(
         &self,
         namespace: &str,
         registry: &Registry,
-        github_token: Option<&str>,
     ) -> Result<Vec<PackageRef>, Error> {
         // Resolve registry config and metadata to construct an OciBackend.
         let registry_config = self
@@ -191,9 +190,7 @@ impl Client {
         let registry_meta = RegistryMetadata::default();
 
         let backend = crate::oci::OciBackend::new(registry, &registry_config, &registry_meta)?;
-        backend
-            .list_packages_in_namespace(namespace, github_token, self.http_client.as_ref())
-            .await
+        backend.list_packages_in_namespace(namespace).await
     }
 
     /// Returns a [`Release`] for the given package version.

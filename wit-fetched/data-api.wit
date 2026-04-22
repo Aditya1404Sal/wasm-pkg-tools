@@ -1,0 +1,29 @@
+package betty-blocks:actions;
+
+interface actions {
+  use betty-blocks:types/types.{json-string};
+
+  record run-payload {
+    input: json-string,
+    configurations: json-string,
+  }
+
+  record run-input {
+    action-id: string,
+    payload: run-payload,
+  }
+
+  record run-output {
+    %result: json-string,
+  }
+
+  variant error {
+    run-failed(string),
+    forbidden,
+  }
+
+  call: func(input: run-input) -> result<run-output, error>;
+
+  health: func() -> result<string, string>;
+}
+

@@ -175,14 +175,23 @@ impl WasmOciTransport {
     ) -> Result<String, Error> {
         let (realm, mut params) = parse_www_authenticate(www_authenticate)?;
 
-        // Replace (or inject) the `scope` param with the correct repository-scoped
-        // value. GHCR's /v2/ challenge includes a generic placeholder scope
-        // (e.g. "repository:user/image:pull") that results in a 403 when used.
-        let actions = match operation {
-            OciOperation::Pull => "pull",
-            OciOperation::Push => "push,pull",
+        // Replace (or inject) the `scope` param with a correctly-scoped value.
+        //
+        // * Empty repository → registry-wide catalog request; Harbor's token
+        //   service requires `registry:catalog:*` here (see Harbor issue #13573).
+        //   `repository::pull` mints a token with no catalog grant and gets 401.
+        // * Non-empty → repository-scoped. GHCR's /v2/ challenge includes a
+        //   generic placeholder scope that results in 403 when used, so we
+        //   always overwrite.
+        let correct_scope = if reference.repository.is_empty() {
+            "registry:catalog:*".to_string()
+        } else {
+            let actions = match operation {
+                OciOperation::Pull => "pull",
+                OciOperation::Push => "push,pull",
+            };
+            format!("repository:{}:{}", reference.repository, actions)
         };
-        let correct_scope = format!("repository:{}:{}", reference.repository, actions);
         if let Some(existing) = params.iter_mut().find(|(k, _)| k == "scope") {
             existing.1 = correct_scope;
         } else {
@@ -238,6 +247,81 @@ impl WasmOciTransport {
                 "token response contained neither 'token' nor 'access_token'"
             ))
         })
+    }
+
+    /// Build and send a request to `/v2/_catalog` with whatever auth is
+    /// currently available (cached bearer token for the catalog, or Basic).
+    async fn send_catalog_request(
+        &self,
+        url: &str,
+        credentials: &OciCredentials,
+        catalog_ref: &OciReference,
+    ) -> Result<wstd_http::Response<wstd_http::Body>, Error> {
+        let req = self
+            .authorized_request(
+                wstd_http::Method::GET,
+                url,
+                credentials,
+                &catalog_ref.repository, // empty string → catalog token cache key
+            )?
+            .body(wstd_http::Body::empty())
+            .map_err(|e| Error::RegistryError(e.into()))?;
+        self.send(req).await
+    }
+
+    /// Handle a 401 response from `/v2/_catalog`.
+    ///
+    /// Per the OCI distribution spec, the server advertises the required auth
+    /// scheme via `WWW-Authenticate`. Harbor is non-spec-compliant here and
+    /// emits `Basic realm="harbor"` instead of a Bearer challenge (see Harbor
+    /// issue #22118); in that case we can't do anything beyond what
+    /// `authorized_request` already attached, so we surface an auth error if
+    /// no Basic credentials were supplied.
+    async fn handle_catalog_challenge(
+        &self,
+        www_auth: &str,
+        credentials: &OciCredentials,
+        catalog_ref: &OciReference,
+    ) -> Result<(), Error> {
+        let lower = www_auth.to_lowercase();
+
+        if lower.starts_with("bearer ") {
+            // Exchange credentials for a catalog-scoped bearer token.
+            // fetch_bearer_token uses `registry:catalog:*` when the reference's
+            // repository is empty.
+            let token = self
+                .fetch_bearer_token(www_auth, credentials, catalog_ref, OciOperation::Pull)
+                .await?;
+            self.bearer_tokens
+                .lock()
+                .unwrap()
+                .insert(catalog_ref.repository.clone(), token);
+            Ok(())
+        } else if lower.starts_with("basic ") {
+            // Harbor path. We already attach Basic in authorized_request when
+            // credentials are Basic; if we still got a 401 the credentials are
+            // wrong or missing.
+            match credentials {
+                OciCredentials::Basic(_, _) => Err(Error::RegistryError(anyhow::anyhow!(
+                    "registry rejected Basic credentials for /v2/_catalog on {}",
+                    catalog_ref.registry
+                ))),
+                OciCredentials::Anonymous => Err(Error::RegistryError(anyhow::anyhow!(
+                    "registry {} requires Basic auth for /v2/_catalog; no credentials configured",
+                    catalog_ref.registry
+                ))),
+            }
+        } else if www_auth.is_empty() {
+            Err(Error::RegistryError(anyhow::anyhow!(
+                "registry {} returned 401 on /v2/_catalog without a WWW-Authenticate header",
+                catalog_ref.registry
+            )))
+        } else {
+            Err(Error::RegistryError(anyhow::anyhow!(
+                "unsupported auth scheme for /v2/_catalog on {}: {www_auth}",
+                catalog_ref.registry
+            )))
+        }
     }
 }
 
@@ -528,14 +612,32 @@ impl OciTransport for WasmOciTransport {
             url.push_str(&format!("last={encoded}"));
         }
 
-        // _catalog is registry-wide (not repo-scoped), so pass an empty
-        // repository string — no cached bearer token will match.
-        let req = self
-            .authorized_request(wstd_http::Method::GET, &url, credentials, "")?
-            .body(wstd_http::Body::empty())
-            .map_err(|e| Error::RegistryError(e.into()))?;
+        // _catalog is registry-wide. Use an empty repository so the cache key
+        // for any cached catalog bearer token is the empty string.
+        let catalog_ref = OciReference::new(registry.to_string(), String::new(), String::new());
 
-        let mut resp = self.send(req).await?;
+        let mut resp = self
+            .send_catalog_request(&url, credentials, &catalog_ref)
+            .await?;
+
+        // If the registry challenges us, complete the auth dance per OCI spec
+        // and retry once.
+        if resp.status() == wstd_http::StatusCode::UNAUTHORIZED {
+            // Copy the header out so we can drop the response reference before
+            // awaiting (wstd_http::Body is !Sync).
+            let www_auth = resp
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            drop(resp);
+            self.handle_catalog_challenge(&www_auth, credentials, &catalog_ref)
+                .await?;
+            resp = self
+                .send_catalog_request(&url, credentials, &catalog_ref)
+                .await?;
+        }
 
         // Extract Link header cursor before consuming the body.
         let next_last = resp

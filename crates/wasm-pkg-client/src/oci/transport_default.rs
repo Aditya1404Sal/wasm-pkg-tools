@@ -177,7 +177,11 @@ impl OciTransport for DefaultOciTransport {
         n: Option<usize>,
         last: Option<&str>,
     ) -> Result<CatalogPage, Error> {
-        // oci_client has no _catalog method, so we call it directly via reqwest.
+        // oci_client has no public _catalog method, so we implement the OCI
+        // distribution auth flow directly via reqwest. On 401 we parse the
+        // WWW-Authenticate challenge and, for Bearer, exchange credentials for
+        // a `registry:catalog:*`-scoped token. For Basic (Harbor), we rely on
+        // the Basic credentials we already attach.
         let scheme = if registry == "localhost" || registry.starts_with("localhost:") {
             "http"
         } else {
@@ -194,15 +198,59 @@ impl OciTransport for DefaultOciTransport {
             url.push_str(&format!("last={}", urlencoding_simple(last)));
         }
 
-        let mut req = reqwest::Client::new().get(&url);
-        if let OciCredentials::Basic(user, pass) = credentials {
-            req = req.basic_auth(user, Some(pass));
-        }
+        let http = reqwest::Client::new();
 
-        let resp = req
+        let build = |bearer: Option<&str>| {
+            let mut req = http.get(&url);
+            if let Some(token) = bearer {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            } else if let OciCredentials::Basic(user, pass) = credentials {
+                req = req.basic_auth(user, Some(pass));
+            }
+            req
+        };
+
+        let mut resp = build(None)
             .send()
             .await
             .map_err(|e| Error::RegistryError(e.into()))?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let www_auth = resp
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            let lower = www_auth.to_lowercase();
+            if lower.starts_with("bearer ") {
+                let token = fetch_catalog_bearer_token(&http, &www_auth, credentials).await?;
+                resp = build(Some(&token))
+                    .send()
+                    .await
+                    .map_err(|e| Error::RegistryError(e.into()))?;
+            } else if lower.starts_with("basic ") {
+                return Err(Error::RegistryError(match credentials {
+                    OciCredentials::Basic(_, _) => anyhow::anyhow!(
+                        "registry rejected Basic credentials for /v2/_catalog on {registry}"
+                    ),
+                    OciCredentials::Anonymous => anyhow::anyhow!(
+                        "registry {registry} requires Basic auth for /v2/_catalog; \
+                         no credentials configured"
+                    ),
+                }));
+            } else if www_auth.is_empty() {
+                return Err(Error::RegistryError(anyhow::anyhow!(
+                    "registry {registry} returned 401 on /v2/_catalog without a \
+                     WWW-Authenticate header"
+                )));
+            } else {
+                return Err(Error::RegistryError(anyhow::anyhow!(
+                    "unsupported auth scheme for /v2/_catalog on {registry}: {www_auth}"
+                )));
+            }
+        }
 
         // Parse the optional Link header for the next page cursor before we
         // consume the response body.
@@ -303,4 +351,99 @@ fn parse_link_header_last(headers: &reqwest::header::HeaderMap) -> Option<String
 /// `/` and `+` which appear in repository names).
 fn urlencoding_simple(s: &str) -> String {
     s.replace('/', "%2F").replace('+', "%2B")
+}
+
+/// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`
+/// header value into `(realm, params)`.
+fn parse_www_authenticate(header: &str) -> Result<(String, Vec<(String, String)>), Error> {
+    let rest = header
+        .trim_start()
+        .strip_prefix("Bearer ")
+        .or_else(|| header.trim_start().strip_prefix("bearer "))
+        .ok_or_else(|| {
+            Error::RegistryError(anyhow::anyhow!("WWW-Authenticate missing Bearer prefix"))
+        })?;
+
+    let mut realm = None;
+    let mut params = Vec::new();
+    for part in rest.split(',') {
+        let part = part.trim();
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        let k = k.trim().to_string();
+        let v = v.trim().trim_matches('"').to_string();
+        if k == "realm" {
+            realm = Some(v);
+        } else {
+            params.push((k, v));
+        }
+    }
+    let realm = realm
+        .ok_or_else(|| Error::RegistryError(anyhow::anyhow!("WWW-Authenticate missing realm")))?;
+    Ok((realm, params))
+}
+
+/// Exchange credentials for a `registry:catalog:*`-scoped bearer token.
+///
+/// Harbor's token service requires exactly this scope for `/v2/_catalog`
+/// (issue #13573). `repository::pull` yields a token with no catalog grant
+/// and the registry responds 401 "insufficient scope".
+async fn fetch_catalog_bearer_token(
+    http: &reqwest::Client,
+    www_authenticate: &str,
+    credentials: &OciCredentials,
+) -> Result<String, Error> {
+    let (realm, mut params) = parse_www_authenticate(www_authenticate)?;
+
+    // Force the catalog scope regardless of what the server advertised.
+    let catalog_scope = "registry:catalog:*".to_string();
+    if let Some(existing) = params.iter_mut().find(|(k, _)| k == "scope") {
+        existing.1 = catalog_scope;
+    } else {
+        params.push(("scope".to_string(), catalog_scope));
+    }
+
+    let mut token_url = realm.clone();
+    let mut first = !token_url.contains('?');
+    for (k, v) in &params {
+        token_url.push(if first { '?' } else { '&' });
+        first = false;
+        token_url.push_str(k);
+        token_url.push('=');
+        token_url.push_str(v);
+    }
+
+    let mut req = http.get(&token_url);
+    if let OciCredentials::Basic(user, pass) = credentials {
+        req = req.basic_auth(user, Some(pass));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| Error::RegistryError(e.into()))?;
+
+    if !resp.status().is_success() {
+        return Err(Error::RegistryError(anyhow::anyhow!(
+            "token endpoint returned HTTP {} for catalog scope",
+            resp.status()
+        )));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TokenResp {
+        token: Option<String>,
+        access_token: Option<String>,
+    }
+    let body: TokenResp = resp
+        .json()
+        .await
+        .map_err(|e| Error::RegistryError(e.into()))?;
+
+    body.token.or(body.access_token).ok_or_else(|| {
+        Error::RegistryError(anyhow::anyhow!(
+            "token response contained neither 'token' nor 'access_token'"
+        ))
+    })
 }

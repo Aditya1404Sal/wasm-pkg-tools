@@ -1,0 +1,16 @@
+package betty-blocks:auth;
+
+interface jwt {
+  variant auth-error {
+    malformed-token,
+    missing-config(string),
+    validation-failed(string),
+  }
+
+  type request-headers = list<tuple<string, list<u8>>>;
+
+  allowed-to-call: func(headers: request-headers, action-id: string) -> result<_, auth-error>;
+
+  allowed-to-list: func(headers: request-headers, mcp-id: string) -> result<_, auth-error>;
+}
+
