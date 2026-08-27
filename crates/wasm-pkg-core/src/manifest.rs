@@ -87,9 +87,7 @@ impl Manifest {
 
     /// Checks that override keys parse and that no package is covered by both a bare and a
     /// versioned key.
-    ///
-    /// Runs when a `wkg.toml` is loaded (see [`validate`](Self::validate)), and again when
-    /// resolving, since a `Manifest` built directly in Rust code skips the load step.
+
     pub(crate) fn validate_override_keys(&self) -> Result<()> {
         let Some(overrides) = self.overrides.as_ref() else {
             return Ok(());
